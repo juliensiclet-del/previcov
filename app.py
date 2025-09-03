@@ -1,5 +1,8 @@
-# PRÉVI-COV — ETP Edition (balanced)
-# Ajustements : élasticités plus douces, baseline risque plus basse, seuils statut élargis.
+# PRÉVI-COV — ETP Edition (gearing + DSO/DPO + scenarios symétriques)
+# - Remplace DSCR par Gearing (Net Debt / Equity), seuil max = 2.0
+# - Seuil Dette/EBITDA par défaut = 3.0
+# - Scénarios symétriques (amélioration possible)
+# - Ajout DSO (max 60j) & DPO (min 60j) avec impacts
 
 import streamlit as st
 import pandas as pd
@@ -14,20 +17,23 @@ st.set_page_config(page_title="PRÉVI-COV — ETP", layout="wide")
 st.title("PRÉVI-COV — ETP (Console IA de gestion prédictive des covenants)")
 
 st.caption(
-    "Importez vos **données financières mensuelles** et votre **suivi chantiers**. "
-    "Simulez des scénarios (matières, retards, météo, taux) et mesurez l'impact sur DSCR / Dette/EBITDA et le risque de bris."
+    "Importez vos **données financières mensuelles** (finance.csv) et votre **suivi chantiers** (projects.csv). "
+    "Simulez des scénarios (matières, retards, météo, taux, règlements clients, paiements fournisseurs) et mesurez l'impact "
+    "sur **Gearing** et **Dette/EBITDA**, ainsi que la **probabilité de bris**."
 )
 
 with st.expander("📄 Formats attendus", expanded=False):
     st.markdown("""
 **1) finance.csv (mensuel, 1 ligne / mois)**  
-- `date` (YYYY-MM-01) • `dscr` (si connu) **ou** `ebitda`,`debt_service`
-- `debt_ebitda` (si connu) **ou** `net_debt`,`ebitda`
-- `cash_net`,`dso`,`dpo`,`steel_index` (opt.),`rate` (taux moyen)
+- `date` (YYYY-MM-01)  
+- `gearing` **ou** `net_debt` & `equity` (sinon estimation pédagogique)  
+- `debt_ebitda` **ou** `net_debt` & `ebitda`  
+- `ebitda`, `net_debt`, `equity` (recommandé), `cash_net`, `dso`, `dpo`, `steel_index` (opt.), `rate` (taux moyen)
 
 **2) projects.csv (suivi chantiers, 1 ligne / chantier / mois)**  
-- `date` • `project_id` • `rp` (reste à produire k€)  
-- `planned_margin_pct` • `actual_margin_pct` • `delay_weeks` • `weather_days`
+- `date`, `project_id`, `rp` (reste à produire k€),  
+- `planned_margin_pct`, `actual_margin_pct` (si dispo),  
+- `delay_weeks`, `weather_days` (jours perdus/mois, opt.)
 """)
 
 # ---------- Upload ----------
@@ -37,24 +43,26 @@ with c1:
 with c2:
     prj_file = st.file_uploader("📥 Importer projects.csv", type=["csv"], key="prj")
 
+# Mode démo si fichiers absents
 if fin_file is None or prj_file is None:
     st.info("Aucun fichier fourni : **mode démo**.")
-    # --- DEMO synthetic ---
     dates = pd.date_range("2023-01-01", periods=30, freq="MS")
     rng = np.random.default_rng(42)
-    ebitda = 1000 + rng.normal(0, 50, len(dates)).cumsum()
+    # Démo réaliste : equity présent pour calcul de gearing
+    equity = 4000 + rng.normal(0, 80, len(dates)).cumsum()
     net_debt = 3500 + rng.normal(0, 80, len(dates))
+    ebitda = 1000 + rng.normal(0, 50, len(dates)).cumsum()
     rate = 1.5 + rng.normal(0, 0.05, len(dates))
     steel_index = 100 + rng.normal(0.5, 1.8, len(dates)).cumsum()
-    interest_paid = np.maximum(0.012*net_debt, 100)
-    debt_service = 400 + 10*(rate-1.5)
-    dscr = np.clip((ebitda / np.maximum(debt_service, 1)), 0.4, 3.5)
-    debt_ebitda = np.clip(net_debt / np.maximum(ebitda, 1), 1.0, 6.0)
+    debt_ebitda = np.clip(net_debt / np.maximum(ebitda, 1), 0.8, 6.0)
+    gearing = np.clip(net_debt / np.maximum(equity, 1), 0.2, 4.0)
     finance = pd.DataFrame({
-        "date": dates, "ebitda": ebitda, "interest_paid": interest_paid, "debt_service": debt_service,
-        "net_debt": net_debt, "steel_index": steel_index, "rate": rate,
-        "cash_net": 500 + rng.normal(0, 30, len(dates)), "dso": 60 + rng.normal(0, 4, len(dates)),
-        "dpo": 55 + rng.normal(0, 3, len(dates)), "dscr": dscr, "debt_ebitda": debt_ebitda
+        "date": dates, "equity": equity, "net_debt": net_debt, "ebitda": ebitda,
+        "gearing": gearing, "debt_ebitda": debt_ebitda,
+        "cash_net": 500 + rng.normal(0, 30, len(dates)),
+        "dso": 65 + rng.normal(0, 5, len(dates)),   # un peu > 60 pour voir effet scenario
+        "dpo": 55 + rng.normal(0, 4, len(dates)),   # un peu < 60 pour voir effet scenario
+        "steel_index": steel_index, "rate": rate
     })
     pr = []
     for d in dates:
@@ -77,16 +85,22 @@ st.subheader("Aperçu des données")
 st.dataframe(finance.tail(6), use_container_width=True)
 st.dataframe(projects.tail(6), use_container_width=True)
 
-# ---------- Paramètres ----------
+# ---------- Paramètres covenants ----------
 st.sidebar.header("⚙️ Paramètres covenants")
-dscr_threshold = st.sidebar.number_input("Seuil DSCR (min)", 1.0, 3.0, 1.3, step=0.1, format="%.2f")
-debt_ebitda_threshold = st.sidebar.number_input("Seuil Dette/EBITDA (max)", 1.0, 8.0, 3.5, step=0.1, format="%.1f")
+# Gearing (max) et Debt/EBITDA (max)
+gearing_threshold = st.sidebar.number_input("Seuil Gearing (max)", 0.5, 5.0, 2.0, step=0.1, format="%.1f")
+debt_ebitda_threshold = st.sidebar.number_input("Seuil Dette/EBITDA (max)", 1.0, 8.0, 3.0, step=0.1, format="%.1f")
 
+# ---------- Scénarios ----------
 st.sidebar.header("🎛️ Scénarios (métier ETP)")
-shock_cost = st.sidebar.slider("Matières : hausse des coûts [%]", -20, 50, 10, step=1)
-shock_delay = st.sidebar.slider("Retards chantier [semaines]", 0, 26, 8, step=1)
-shock_weather = st.sidebar.slider("Météo défavorable [jours/mois]", 0, 20, 4, step=1)
-shock_rate = st.sidebar.slider("Hausse des taux [points]", -1, 4, 1, step=1)
+shock_cost = st.sidebar.slider("Matières : variation des coûts [%]", -20, 50, 0, step=1)         # symétrique
+shock_delay = st.sidebar.slider("Retards chantier [semaines]", -4, 26, 0, step=1)                # autorise -4 = rattrapage
+shock_weather = st.sidebar.slider("Météo défavorable [jours/mois]", -5, 20, 0, step=1)           # autorise -5 = météo meilleure
+shock_rate = st.sidebar.slider("Variation des taux [points]", -2, 4, 0, step=1)                  # autorise baisse de taux
+
+# Contraintes de bonnes pratiques : DSO max 60, DPO min 60
+client_terms = st.sidebar.slider("Règlements clients — DSO [jours] (max 60)", 30, 60, 60, step=5)
+supplier_terms = st.sidebar.slider("Paiements fournisseurs — DPO [jours] (min 60)", 60, 120, 60, step=5)
 
 # ---------- Outils ----------
 def simple_forecast(series, periods=12):
@@ -100,33 +114,54 @@ def simple_forecast(series, periods=12):
 
 def ensure_ratios(fin):
     out = fin.copy()
-    if "dscr" not in out or out["dscr"].isna().all():
-        if {"ebitda","debt_service"}.issubset(out.columns):
-            out["dscr"] = out["ebitda"] / out["debt_service"].clip(lower=1e-6)
+    # Gearing
+    if "gearing" not in out or out["gearing"].isna().all():
+        if {"net_debt","equity"}.issubset(out.columns):
+            out["gearing"] = out["net_debt"] / out["equity"].replace(0, np.nan)
+        else:
+            # fallback pédagogique : equity estimée pour permettre la démo (à remplacer par une vraie colonne 'equity')
+            approx_equity = np.maximum(out.get("net_debt", pd.Series([2000]*len(out))), 1) / 1.6
+            out["gearing"] = out.get("net_debt", pd.Series([2000]*len(out))) / approx_equity
+    # Debt/EBITDA
     if "debt_ebitda" not in out or out["debt_ebitda"].isna().all():
         if {"net_debt","ebitda"}.issubset(out.columns):
-            out["debt_ebitda"] = out["net_debt"] / out["ebitda"].clip(lower=1e-6)
+            out["debt_ebitda"] = out["net_debt"] / out["ebitda"].replace(0, np.nan)
     return out
 
 def project_weighted_margin(projects_month):
     df = projects_month.copy()
-    if df.empty:
-        return np.nan
+    if df.empty: return np.nan
     w = df["rp"].clip(lower=0.0)
     base_margin = np.where(df["actual_margin_pct"].notna(), df["actual_margin_pct"], df["planned_margin_pct"])
     return float((w * base_margin).sum() / max(w.sum(), 1e-6))
 
-# 🔧 Élasticités adoucies (plus "équilibrées")
-# +10% matières  => DSCR -0.10 ; Debt/EBITDA +0.15
-# +4 semaines    => DSCR -0.04 ; Debt/EBITDA +0.03
-# +5 jours météo => DSCR -0.02 ; Debt/EBITDA +0.02
-# +1 pt taux     => DSCR -0.04 ; Debt/EBITDA +0.03
-def apply_etp_scenarios(dscr, de, portfolio_margin, steel_idx, rate,
-                        shock_cost, shock_delay_weeks, shock_weather_days, shock_rate_pts):
-    dscr_adj = dscr - 0.01*shock_cost - 0.04*(shock_delay_weeks/4) - 0.02*(shock_weather_days/5) - 0.04*shock_rate_pts
-    de_adj   = de   + 0.015*shock_cost + 0.03*(shock_delay_weeks/4) + 0.02*(shock_weather_days/5) + 0.03*shock_rate_pts
+# Élasticités "équilibrées" + effets symétriques (valeurs pédagogiques)
+# +10% matières  => Gearing +0.10 ; Debt/EBITDA +0.15
+# +4 semaines    => Gearing +0.04 ; Debt/EBITDA +0.03
+# +5 jours météo => Gearing +0.02 ; Debt/EBITDA +0.02
+# +1 pt taux     => Gearing +0.04 ; Debt/EBITDA +0.03
+# DSO/DPO : référence 60/60 ; DSO > 60 => dégrade, DPO > 60 => améliore
+def apply_etp_scenarios(gearing_vals, de_vals, portfolio_margin,
+                        shock_cost, shock_delay_weeks, shock_weather_days, shock_rate_pts,
+                        client_terms_days, supplier_terms_days):
+    g_adj = (gearing_vals
+             + 0.01*shock_cost
+             + 0.04*(shock_delay_weeks/4)
+             + 0.02*(shock_weather_days/5)
+             + 0.04*shock_rate_pts)
+    de_adj = (de_vals
+              + 0.015*shock_cost
+              + 0.03*(shock_delay_weeks/4)
+              + 0.02*(shock_weather_days/5)
+              + 0.03*shock_rate_pts)
+    # DSO / DPO par rapport à la cible 60 / 60
+    delta_dso = client_terms_days - 60   # <= 0 (max 60)
+    delta_dpo = supplier_terms_days - 60 # >= 0 (min 60)
+    g_adj = g_adj + 0.003*delta_dso - 0.003*delta_dpo    # DSO↓/DPO↑ => g↓
+    de_adj = de_adj + 0.010*(delta_dso/10) - 0.010*(delta_dpo/10)  # effet moindre sur de
+    # marge portefeuille indicative
     margin_adj = portfolio_margin - (1.0*(shock_cost/10.0) + 0.4*(shock_delay_weeks/4.0) + 0.2*(shock_weather_days/5.0))
-    return np.maximum(dscr_adj, 0.3), np.maximum(de_adj, 0.5), margin_adj
+    return np.maximum(g_adj, 0.05), np.maximum(de_adj, 0.3), margin_adj
 
 # ---------- Préparation ----------
 finance = ensure_ratios(finance)
@@ -135,29 +170,32 @@ h = 12
 future_dates = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=h, freq="MS")
 
 fcst = pd.DataFrame({"date": future_dates})
-fcst["dscr_fcst"] = simple_forecast(finance["dscr"], periods=h)
+fcst["gearing_fcst"] = simple_forecast(finance["gearing"], periods=h)
 fcst["debt_ebitda_fcst"] = simple_forecast(finance["debt_ebitda"], periods=h)
 
 current_month = projects[projects["date"]==projects["date"].max()]
 port_margin_now = project_weighted_margin(current_month)
 
-fcst["dscr_scn"], fcst["de_scn"], fcst["margin_portfolio_scn"] = apply_etp_scenarios(
-    dscr=fcst["dscr_fcst"].values,
-    de=fcst["debt_ebitda_fcst"].values,
+fcst["gearing_scn"], fcst["de_scn"], fcst["margin_portfolio_scn"] = apply_etp_scenarios(
+    gearing_vals=fcst["gearing_fcst"].values,
+    de_vals=fcst["debt_ebitda_fcst"].values,
     portfolio_margin=port_margin_now if not np.isnan(port_margin_now) else 12.0,
-    steel_idx=finance.get("steel_index", pd.Series(index=finance.index, data=np.nan)).iloc[-1] if "steel_index" in finance else 100.0,
-    rate=finance.get("rate", pd.Series(index=finance.index, data=np.nan)).iloc[-1] if "rate" in finance else 1.5,
-    shock_cost=shock_cost, shock_delay_weeks=shock_delay, shock_weather_days=shock_weather, shock_rate_pts=shock_rate
+    shock_cost=shock_cost,
+    shock_delay_weeks=shock_delay,
+    shock_weather_days=shock_weather,
+    shock_rate_pts=shock_rate,
+    client_terms_days=client_terms,
+    supplier_terms_days=supplier_terms
 )
 
-# ---------- Risque 12m ----------
+# ---------- Risque 12m (cible : dépassement des seuils) ----------
 tmp = finance.copy()
-tmp["breach_dscr"] = (tmp["dscr"].rolling(12, min_periods=1).min() < dscr_threshold).shift(-11).fillna(False)
+tmp["breach_gearing"] = (tmp["gearing"].rolling(12, min_periods=1).max() > gearing_threshold).shift(-11).fillna(False)
 tmp["breach_debt_ebitda"] = (tmp["debt_ebitda"].rolling(12, min_periods=1).max() > debt_ebitda_threshold).shift(-11).fillna(False)
-tmp["breach_any"] = (tmp["breach_dscr"] | tmp["breach_debt_ebitda"]).astype(int)
+tmp["breach_any"] = (tmp["breach_gearing"] | tmp["breach_debt_ebitda"]).astype(int)
 
-feat = tmp[["dscr","debt_ebitda","cash_net","dso","dpo","rate"]].copy()
-for col in ["dscr","debt_ebitda","cash_net"]:
+feat = tmp[["gearing","debt_ebitda","cash_net","dso","dpo","rate"]].copy()
+for col in ["gearing","debt_ebitda","cash_net"]:
     feat[f"{col}_chg_3m"] = feat[col].diff(3)
     feat[f"{col}_chg_6m"] = feat[col].diff(6)
 feat = feat.fillna(0.0)
@@ -172,25 +210,30 @@ if y.sum() > 1 and len(finance) > 24:
     x_last = feat.iloc[-1:].values
     prob_base = float(model.predict_proba(x_last)[0,1])
 else:
-    prob_base = 0.10  # 🔽 baseline plus basse pour éviter "toujours rouge"
+    prob_base = 0.10  # baseline plus basse
 
-# 🔧 Uplift de risque adouci (points de probabilité)
+# Uplift symétrique (en points de probabilité) : négatif si scénario favorable
 uplift = (
-    0.006*max(shock_cost,0) +     # +0,6 pp / +1% matières
-    0.01*(shock_delay/4)   +      # +1 pp / 4 semaines
-    0.007*(shock_weather/5)+      # +0,7 pp / 5 jours météo
-    0.03*max(shock_rate,0)        # +3 pp / +1 pt de taux
+    0.006*shock_cost +           # ±0,6 pp par ±1% matières
+    0.010*(shock_delay/4) +      # ±1,0 pp par 4 semaines
+    0.007*(shock_weather/5) +    # ±0,7 pp par 5 jours
+    0.030*shock_rate             # ±3,0 pp par 1 point de taux
 )
+# Effet DSO/DPO (réf. 60/60)
+delta_dso = client_terms - 60    # <=0
+delta_dpo = supplier_terms - 60  # >=0
+uplift += 0.002*delta_dso - 0.002*delta_dpo
+
 prob_scn = float(np.clip(prob_base + uplift, 0.0, 0.99))
 
 # ---------- Graphiques ----------
 col1, col2 = st.columns(2)
 with col1:
-    st.subheader("DSCR — Historique & Prévision (scénario)")
-    hist = finance[["date","dscr"]].rename(columns={"dscr":"value"}); hist["type"]="Historique"
-    fut = fcst[["date","dscr_scn"]].rename(columns={"dscr_scn":"value"}); fut["type"]="Prévision (scénario)"
+    st.subheader("Gearing — Historique & Prévision (scénario)")
+    hist = finance[["date","gearing"]].rename(columns={"gearing":"value"}); hist["type"]="Historique"
+    fut = fcst[["date","gearing_scn"]].rename(columns={"gearing_scn":"value"}); fut["type"]="Prévision (scénario)"
     fig = px.line(pd.concat([hist, fut]), x="date", y="value", color="type")
-    fig.add_hline(y=dscr_threshold)
+    fig.add_hline(y=gearing_threshold)
     st.plotly_chart(fig, use_container_width=True)
 
 with col2:
@@ -206,25 +249,22 @@ st.subheader("🛑 Risque de bris (12 mois)")
 c1, c2, c3 = st.columns(3)
 c1.metric("Probabilité (baseline)", f"{prob_base:.0%}")
 c2.metric("Probabilité (scénario)", f"{prob_scn:.0%}", delta=f"{(prob_scn-prob_base):+.0%}")
-
-# 🔧 Seuils rééquilibrés
 status = "🟢 Sûr" if prob_scn < 0.30 else ("🟠 Sous surveillance" if prob_scn < 0.60 else "🔴 Risque élevé")
 c3.metric("Statut", status)
 
 st.markdown("### 🧭 Lecture & recommandations")
 st.markdown(
 f"""
-- **Hypothèses de scénario** : matières **+{shock_cost}%**, retards **{shock_delay} sem**, météo **{shock_weather} j/mois**, taux **+{shock_rate} pt**.  
-- **Élasticités (équilibrées)** : +10% matières → DSCR **-0,10** / Dette/EBITDA **+0,15** ; +4 sem → DSCR **-0,04** ; +5 jours météo → DSCR **-0,02** ; +1 pt taux → DSCR **-0,04**.  
-- **Marge portefeuille pondérée (RàP)** (approx. scénario courant) : ~ **{fcst['margin_portfolio_scn'].iloc[0]:.1f}%**.
+- **Hypothèses de scénario** : matières **{shock_cost:+d}%**, retards **{shock_delay:+d} sem**, météo **{shock_weather:+d} j/mois**, taux **{shock_rate:+d} pt** ; DSO **{client_terms} j** (≤ 60), DPO **{supplier_terms} j** (≥ 60).  
+- **Effets (équilibrés & symétriques)** : un scénario favorable **réduit** les ratios & le risque ; un scénario défavorable **les augmente**.  
+- **Marge portefeuille pondérée (RàP)** (indicative) : ~ **{fcst['margin_portfolio_scn'].iloc[0]:.1f}%**.
 """
 )
 
 st.info(
-"**Actions possibles** : prioriser chantiers à forte marge RàP ; "
-"préparer un plan de trésorerie ; lisser CAPEX ; "
-"activer relances pour réduire DSO ; "
-"si 🟠/🔴 durable, anticiper un échange bancaire (stress tests en annexe)."
+"**Bonnes pratiques** : viser **DSO ≤ 60 j** et **DPO ≥ 60 j** ; prioriser chantiers à forte marge RàP ; "
+"préparer un plan de trésorerie ; activer relances clients ; négocier conditions fournisseurs ; "
+"si 🟠/🔴 durable, anticiper un échange bancaire avec stress tests en annexe."
 )
 
-st.caption("Outil pédagogique : à calibrer sur données réelles ETP pour décision.")
+st.caption("Outil pédagogique : à calibrer sur données réelles ETP (inclure idéalement une colonne 'equity' pour un gearing exact).")
