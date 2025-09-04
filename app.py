@@ -1,9 +1,9 @@
-# PRÉVI-COV — ETP (prévisions prudentes, gearing borné)
+# PRÉVI-COV — ETP (prévisions prudentes, libellés FR)
 # - Prévisions centrées sur moyenne mobile 12m + pente limitée (±0,05/mois)
 # - Nettoyage : winsorisation + médiane glissante + bornes DSO/DPO + gearing clip(1.0, 2.0)
 # - Scénarios ETP : matières, retards, météo, taux, DSO≤60 / DPO≥60 (effets symétriques et doux)
 # - Règles métier : cap post-scénarios + override “situation idéale” + cohérence Dette/EBITDA→risque
-# - UI 100% française
+# - UI 100% française (Risque actuel / Risque projeté)
 
 import streamlit as st
 import pandas as pd
@@ -19,7 +19,7 @@ st.title("PRÉVI-COV — ETP — Prévisions prudentes")
 
 st.caption(
     "Prévisions à 12 mois **stabilisées** : moyenne mobile 12 mois + pente limitée. "
-    "Objectif : des trajectoires crédibles, sans envolées artificielles."
+    "Objectif : trajectoires crédibles, sans envolées artificielles."
 )
 
 # ----------------- Upload & démo -----------------
@@ -30,15 +30,14 @@ with c2:
     prj_file = st.file_uploader("📥 Importer projects.csv", type=["csv"])
 
 if fin_file is None or prj_file is None:
-    st.info("Mode démo (données réalistes). Chargez les vôtres pour vos simulations.")
-    # Démo réaliste (alignée covenant : levier ≤ 3 ; gearing ~ 1.5–2.0)
+    st.info("Mode démo (données réalistes). Chargez vos fichiers pour vos simulations.")
+    # Démo réaliste (levier ≤ 3 ; gearing ~ 1.5–2.0)
     dates = pd.date_range("2023-01-01", periods=36, freq="MS")
     rng = np.random.default_rng(42)
     net_debt = 3000 + rng.normal(0, 50, len(dates))
     ebitda   = 1200 + rng.normal(0, 30, len(dates))
     equity   = 4550 + rng.normal(0, 60, len(dates))
     debt_ebitda = np.clip(net_debt / np.maximum(ebitda, 1), 2.40, 2.60)
-    # gearing simulé autour de 1.6–1.9
     gearing = np.clip(1.6 + np.sin(np.linspace(0, 3.1, len(dates)))*0.2 + rng.normal(0, 0.03, len(dates)), 1.5, 2.0)
     finance = pd.DataFrame({
         "date": dates,
@@ -50,7 +49,6 @@ if fin_file is None or prj_file is None:
         "steel_index": 100 + rng.normal(0.4, 1.5, len(dates)).cumsum(),
         "rate": 1.5 + rng.normal(0, 0.05, len(dates)),
     })
-    # projects démo simple
     pr = []
     for d in dates:
         for pid in ["A12","B07","C03","D15"]:
@@ -189,7 +187,7 @@ fcst["gearing_scn"], fcst["de_scn"] = apply_etp_scenarios(
 fcst["gearing_scn"] = np.clip(fcst["gearing_scn"], 0.0, gearing_threshold * 1.5)
 fcst["de_scn"]      = np.clip(fcst["de_scn"],      0.0, debt_ebitda_threshold * 1.5)
 
-# ----------------- Probabilité de bris (12 mois) -----------------
+# ----------------- Risque (12 mois) -----------------
 tmp = finance.copy()
 tmp["breach_gearing"]      = (tmp["gearing"].rolling(12, min_periods=1).max() > gearing_threshold).shift(-11).fillna(False)
 tmp["breach_debt_ebitda"]  = (tmp["debt_ebitda"].rolling(12, min_periods=1).max() > debt_ebitda_threshold).shift(-11).fillna(False)
@@ -265,3 +263,20 @@ with col2:
 
 st.caption("Prévisions **prudemment ancrées** (moyenne mobile 12m) avec **pente limitée** ; cap léger post-scénarios. "
            "Historique borné : Dette/EBITDA ≤ 3 ; Gearing ∈ [1.0 ; 2.0].")
+
+# ----------------- Résultats risque (affichage) -----------------
+st.markdown("---")
+st.subheader("🛑 Risque de bris de covenant (12 mois)")
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Risque actuel", f"{prob_reference:.0%}")
+c2.metric("Risque projeté", f"{prob_scenario:.0%}", delta=f"{(prob_scenario - prob_reference):+.0%}")
+
+# Statut clair
+if prob_scenario < 0.20:
+    status = "🟢 Sûr"
+elif prob_scenario < 0.40:
+    status = "🟠 Sous surveillance"
+else:
+    status = "🔴 Risque élevé"
+c3.metric("Statut", status)
