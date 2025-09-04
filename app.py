@@ -1,9 +1,9 @@
-# PRÉVI-COV — ETP (prévisions prudentes, libellés FR)
+# PRÉVI-COV — ETP (prévisions prudentes + saisonnalité mensuelle optionnelle)
 # - Prévisions centrées sur moyenne mobile 12m + pente limitée (±0,05/mois)
 # - Nettoyage : winsorisation + médiane glissante + bornes DSO/DPO + gearing clip(1.0, 2.0)
-# - Scénarios ETP : matières, retards, météo, taux, DSO≤60 / DPO≥60 (effets symétriques et doux)
-# - Règles métier : cap post-scénarios + override “situation idéale” + cohérence Dette/EBITDA→risque
-# - UI 100% française (Risque actuel / Risque projeté)
+# - Scénarios ETP : matières, retards, météo, taux, DSO≤60 / DPO≥60
+# - Saisonnalité mensuelle (hiver/août) : calculée sur l’historique ou profil ETP par défaut
+# - Risque : “Risque actuel” vs “Risque projeté” + Statut
 
 import streamlit as st
 import pandas as pd
@@ -14,12 +14,12 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 import plotly.express as px
 
-st.set_page_config(page_title="PRÉVI-COV — ETP (prévisions prudentes)", layout="wide")
-st.title("PRÉVI-COV — ETP — Prévisions prudentes")
+st.set_page_config(page_title="PRÉVI-COV — ETP (saisonnalité incluse)", layout="wide")
+st.title("PRÉVI-COV — ETP — Prévisions prudentes (avec saisonnalité)")
 
 st.caption(
-    "Prévisions à 12 mois **stabilisées** : moyenne mobile 12 mois + pente limitée. "
-    "Objectif : trajectoires crédibles, sans envolées artificielles."
+    "Prévisions 12 mois **stabilisées** (moyenne mobile + pente limitée), avec **saisonnalité mensuelle** optionnelle "
+    "(mois d’hiver et août plus défavorables, typiques ETP)."
 )
 
 # ----------------- Upload & démo -----------------
@@ -49,6 +49,7 @@ if fin_file is None or prj_file is None:
         "steel_index": 100 + rng.normal(0.4, 1.5, len(dates)).cumsum(),
         "rate": 1.5 + rng.normal(0, 0.05, len(dates)),
     })
+    # projects démo simple
     pr = []
     for d in dates:
         for pid in ["A12","B07","C03","D15"]:
@@ -79,6 +80,10 @@ shock_rate = st.sidebar.slider("Variation des taux [points]", -2, 4, 0, step=1)
 client_terms = st.sidebar.slider("Délai règlements clients (DSO) [jours] — viser ≤ 60", 30, 120, 60, step=5)
 supplier_terms = st.sidebar.slider("Délai paiements fournisseurs (DPO) [jours] — viser ≥ 60", 30, 120, 60, step=5)
 
+st.sidebar.header("📅 Saisonnalité (mensuelle)")
+use_seasonality = st.sidebar.checkbox("Activer la saisonnalité (mois)", value=True)
+seasonality_strength = st.sidebar.slider("Intensité saisonnière (× historique)", 0.0, 1.5, 1.0, 0.1)
+
 # ----------------- Utilitaires -----------------
 def ensure_ratios(fin: pd.DataFrame) -> pd.DataFrame:
     out = fin.copy()
@@ -106,7 +111,7 @@ def clean_finance(fin: pd.DataFrame) -> pd.DataFrame:
     df = fin.copy().sort_values("date")
     # Cohérence historique : levier ≤ 3 ; gearing dans [1.0 ; 2.0]
     if "debt_ebitda" in df:
-        df["debt_ebitda"] = df["debt_ebitda"].clip(0.5, 3.0)
+        df["debt_ebitda"] = df["debt_ebitda"].clip(0.5, 6.0)
     if "gearing" in df:
         df["gearing"] = df["gearing"].clip(1.0, 2.0)
     # Plages métier DSO/DPO + interpolation douce
@@ -142,6 +147,27 @@ def conservative_forecast(series: pd.Series, periods: int = 12,
     blended = blend * base + (1 - blend) * anchor
     return blended
 
+def month_seasonality_additive(series: pd.Series) -> np.ndarray:
+    """
+    Indices saisonniers additifs par mois (déviation par rapport à la moyenne).
+    Si historique < 18 points, on renvoie un profil ETP par défaut.
+    Retour: array de longueur 12, centré à 0.
+    """
+    s = series.dropna()
+    if len(s) >= 18:
+        dfm = s.to_frame("y")
+        dfm["m"] = dfm.index.month
+        mu = dfm["y"].mean()
+        seas = dfm.groupby("m")["y"].mean() - mu  # additif
+        seas = seas.reindex(range(1,13)).fillna(0.0).values
+        seas = seas - seas.mean()  # recentrer
+        return seas
+    # Profil ETP par défaut (mois défavorables: jan, fév, août)
+    # valeurs additifs modestes (sur ratio): +0.06 en jan/fév/août ; -0.04 au printemps/automne
+    template = np.array([+0.06, +0.06, +0.00, -0.03, -0.04, -0.03, -0.01, +0.06, -0.02, -0.01, 0.00, +0.02])
+    template = template - template.mean()
+    return template
+
 def apply_etp_scenarios(gearing_vals, de_vals,
                         shock_cost, shock_delay_weeks, shock_weather_days, shock_rate_pts,
                         client_terms_days, supplier_terms_days):
@@ -171,11 +197,21 @@ last_date = finance["date"].max()
 h = 12
 future_dates = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=h, freq="MS")
 
-# ----------------- Prévisions prudentes -----------------
+# ----------------- Prévisions prudentes (base) -----------------
 fcst = pd.DataFrame({"date": future_dates})
 gearing_raw = conservative_forecast(finance.set_index("date")["gearing"], periods=h, slope_cap=0.03, blend=0.5)
 de_raw      = conservative_forecast(finance.set_index("date")["debt_ebitda"], periods=h, slope_cap=0.05, blend=0.5)
 
+# ----------------- Saisonnalité mensuelle (optionnelle) -----------------
+if use_seasonality:
+    seas_g = month_seasonality_additive(finance.set_index("date")["gearing"])
+    seas_de = month_seasonality_additive(finance.set_index("date")["debt_ebitda"])
+    # appliquer mois par mois
+    months_idx = np.array([d.month for d in future_dates]) - 1
+    gearing_raw = gearing_raw + seasonality_strength * seas_g[months_idx]
+    de_raw      = de_raw      + seasonality_strength * seas_de[months_idx]
+
+# Clipper par rapport aux seuils (tolérance 40%)
 fcst["gearing_fcst"]      = np.clip(gearing_raw, 0.0, gearing_threshold * 1.4)
 fcst["debt_ebitda_fcst"]  = np.clip(de_raw,      0.0, debt_ebitda_threshold * 1.4)
 
@@ -261,8 +297,10 @@ with col2:
     fig.add_hline(y=debt_ebitda_threshold)
     st.plotly_chart(fig, use_container_width=True)
 
-st.caption("Prévisions **prudemment ancrées** (moyenne mobile 12m) avec **pente limitée** ; cap léger post-scénarios. "
-           "Historique borné : Dette/EBITDA ≤ 3 ; Gearing ∈ [1.0 ; 2.0].")
+st.caption(
+    "Prévisions **ancrées** (moyenne mobile + pente limitée). "
+    "La **saisonnalité mensuelle** renforce les mois traditionnellement défavorables (janv/févr/août), selon l’historique ETP."
+)
 
 # ----------------- Résultats risque (affichage) -----------------
 st.markdown("---")
@@ -272,7 +310,6 @@ c1, c2, c3 = st.columns(3)
 c1.metric("Risque actuel", f"{prob_reference:.0%}")
 c2.metric("Risque projeté", f"{prob_scenario:.0%}", delta=f"{(prob_scenario - prob_reference):+.0%}")
 
-# Statut clair
 if prob_scenario < 0.20:
     status = "🟢 Sûr"
 elif prob_scenario < 0.40:
