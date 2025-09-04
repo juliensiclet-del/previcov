@@ -1,7 +1,7 @@
-# PRÉVI-COV — ETP (prévisions prudentes, historique réaliste)
+# PRÉVI-COV — ETP (prévisions prudentes, gearing borné)
 # - Prévisions centrées sur moyenne mobile 12m + pente limitée (±0,05/mois)
-# - Nettoyage historique (winsorisation + médiane glissante + bornes DSO/DPO)
-# - Scénarios ETP symétriques (matières, retards, météo, taux, DSO≤60 / DPO≥60)
+# - Nettoyage : winsorisation + médiane glissante + bornes DSO/DPO + gearing clip(1.0, 2.0)
+# - Scénarios ETP : matières, retards, météo, taux, DSO≤60 / DPO≥60 (effets symétriques et doux)
 # - Règles métier : cap post-scénarios + override “situation idéale” + cohérence Dette/EBITDA→risque
 # - UI 100% française
 
@@ -31,14 +31,15 @@ with c2:
 
 if fin_file is None or prj_file is None:
     st.info("Mode démo (données réalistes). Chargez les vôtres pour vos simulations.")
-    # Démo réaliste (alignée covenant : levier ≤ 3)
+    # Démo réaliste (alignée covenant : levier ≤ 3 ; gearing ~ 1.5–2.0)
     dates = pd.date_range("2023-01-01", periods=36, freq="MS")
     rng = np.random.default_rng(42)
     net_debt = 3000 + rng.normal(0, 50, len(dates))
     ebitda   = 1200 + rng.normal(0, 30, len(dates))
-    equity   = 4500 + rng.normal(0, 80, len(dates))
-    debt_ebitda = np.clip(net_debt / np.maximum(ebitda, 1), 2.2, 2.9)
-    gearing     = np.clip(net_debt / np.maximum(equity, 1), 1.2, 1.8)
+    equity   = 4550 + rng.normal(0, 60, len(dates))
+    debt_ebitda = np.clip(net_debt / np.maximum(ebitda, 1), 2.40, 2.60)
+    # gearing simulé autour de 1.6–1.9
+    gearing = np.clip(1.6 + np.sin(np.linspace(0, 3.1, len(dates)))*0.2 + rng.normal(0, 0.03, len(dates)), 1.5, 2.0)
     finance = pd.DataFrame({
         "date": dates,
         "net_debt": net_debt, "ebitda": ebitda, "equity": equity,
@@ -49,15 +50,11 @@ if fin_file is None or prj_file is None:
         "steel_index": 100 + rng.normal(0.4, 1.5, len(dates)).cumsum(),
         "rate": 1.5 + rng.normal(0, 0.05, len(dates)),
     })
+    # projects démo simple
     pr = []
     for d in dates:
         for pid in ["A12","B07","C03","D15"]:
-            rp = rng.integers(300, 900)
-            planned_margin = 12 + rng.normal(0, 1.0)
-            actual_margin  = planned_margin + rng.normal(-0.3, 0.6)
-            delay_weeks    = max(0, int(rng.normal(2, 1.5)))
-            weather_days   = max(0, int(rng.normal(2, 1.5)))
-            pr.append([d, pid, rp, planned_margin, actual_margin, delay_weeks, weather_days])
+            pr.append([d, pid, 600, 12.0, 11.6, 2, 2])
     projects = pd.DataFrame(pr, columns=[
         "date","project_id","rp","planned_margin_pct","actual_margin_pct","delay_weeks","weather_days"
     ])
@@ -109,17 +106,19 @@ def smooth_rolling_median(s: pd.Series, window=3) -> pd.Series:
 
 def clean_finance(fin: pd.DataFrame) -> pd.DataFrame:
     df = fin.copy().sort_values("date")
-    # Borne pédagogique : levier ≤ 3 en historique (cohérence covenant)
+    # Cohérence historique : levier ≤ 3 ; gearing dans [1.0 ; 2.0]
     if "debt_ebitda" in df:
         df["debt_ebitda"] = df["debt_ebitda"].clip(0.5, 3.0)
-    # Plages métier + interpolation douce DSO/DPO
+    if "gearing" in df:
+        df["gearing"] = df["gearing"].clip(1.0, 2.0)
+    # Plages métier DSO/DPO + interpolation douce
     for col in ["dso","dpo"]:
         if col in df:
             df[col] = df[col].clip(30, 120)
             jump = df[col].diff().abs() > 40
             df.loc[jump, col] = np.nan
             df[col] = df[col].interpolate(limit_direction="both")
-    # Lissage & winsorisation sur ratios
+    # Lissage & winsorisation
     for col in ["debt_ebitda","gearing"]:
         if col in df:
             df[col] = smooth_rolling_median(df[col])
@@ -148,6 +147,7 @@ def conservative_forecast(series: pd.Series, periods: int = 12,
 def apply_etp_scenarios(gearing_vals, de_vals,
                         shock_cost, shock_delay_weeks, shock_weather_days, shock_rate_pts,
                         client_terms_days, supplier_terms_days):
+    # Effets doux & symétriques
     g_adj = (gearing_vals
              + 0.008*shock_cost
              + 0.03*(shock_delay_weeks/4)
@@ -158,6 +158,7 @@ def apply_etp_scenarios(gearing_vals, de_vals,
               + 0.025*(shock_delay_weeks/4)
               + 0.015*(shock_weather_days/5)
               + 0.025*shock_rate_pts)
+    # DSO/DPO vs 60 j : DSO>60 dégrade ; DPO<60 dégrade
     delta_dso = client_terms_days - 60
     delta_dpo = supplier_terms_days - 60
     g_adj = g_adj + 0.003*delta_dso - 0.003*delta_dpo
@@ -263,19 +264,4 @@ with col2:
     st.plotly_chart(fig, use_container_width=True)
 
 st.caption("Prévisions **prudemment ancrées** (moyenne mobile 12m) avec **pente limitée** ; cap léger post-scénarios. "
-           "Historique borné à ≤ 3 pour respecter le covenant de levier.")
-
-st.markdown("---")
-st.subheader("🛑 Probabilité de bris (12 mois)")
-c1, c2, c3 = st.columns(3)
-c1.metric("Probabilité (référence)", f"{prob_reference:.0%}")
-c2.metric("Probabilité (scénario)", f"{prob_scenario:.0%}", delta=f"{(prob_scenario-prob_reference):+.0%}")
-statut = "🟢 Sûr" if prob_scenario < 0.30 else ("🟠 Sous surveillance" if prob_scenario < 0.60 else "🔴 Risque élevé")
-c3.metric("Statut", statut)
-
-st.info(
-"Astuce : si vos courbes historiques oscillent dans une fourchette serrée, ces prévisions resteront **stables et crédibles**. "
-"Pour des scénarios extrêmes, ajustez la **pente max** (`slope_cap`) ou le **cap** post-scénarios."
-)
-
-st.caption("Dépendances : streamlit, pandas, numpy, scikit-learn, plotly.")
+           "Historique borné : Dette/EBITDA ≤ 3 ; Gearing ∈ [1.0 ; 2.0].")
