@@ -109,25 +109,33 @@ def smooth_rolling_median(s: pd.Series, window=3) -> pd.Series:
 
 def clean_finance(fin: pd.DataFrame) -> pd.DataFrame:
     df = fin.copy().sort_values("date")
-    # Cohérence historique : levier ≤ 3 ; gearing dans [1.0 ; 2.0]
-if "debt_ebitda" in df:
-    df["debt_ebitda"] = df["debt_ebitda"].clip(0.5, 6.0)  # laisse passer >3 en cas de creux (ex. été/hiver)
-if "gearing" in df:
+
+    # Cohérence historique : bornes simples
+    if "debt_ebitda" in df.columns:
+        df["debt_ebitda"] = pd.to_numeric(df["debt_ebitda"], errors="coerce")
+        df["debt_ebitda"] = df["debt_ebitda"].interpolate(limit_direction="both")
+        df["debt_ebitda"] = df["debt_ebitda"].clip(0.5, 10.0)
+
+    if "gearing" in df.columns:
+        df["gearing"] = pd.to_numeric(df["gearing"], errors="coerce")
+        df["gearing"] = df["gearing"].interpolate(limit_direction="both")
         df["gearing"] = df["gearing"].clip(1.0, 2.0)
+
     # Plages métier DSO/DPO + interpolation douce
-    for col in ["dso","dpo"]:
-        if col in df:
+    for col in ["dso", "dpo"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
             df[col] = df[col].clip(30, 120)
             jump = df[col].diff().abs() > 40
             df.loc[jump, col] = np.nan
             df[col] = df[col].interpolate(limit_direction="both")
-    # Lissage & winsorisation
-    for col in ["debt_ebitda","gearing"]:
-        if col in df:
+
+    # Lissage & winsorisation si dispo
+    for col in ["debt_ebitda", "gearing"]:
+        if col in df.columns:
             df[col] = smooth_rolling_median(df[col])
             df[col] = winsorize(df[col], 0.02, 0.98)
     return df
-
 def conservative_forecast(series: pd.Series, periods: int = 12,
                           ma_window: int = 12, slope_cap: float = 0.05,
                           blend: float = 0.5) -> np.ndarray:
